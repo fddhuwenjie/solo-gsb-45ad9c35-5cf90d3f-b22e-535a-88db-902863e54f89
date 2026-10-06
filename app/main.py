@@ -25,6 +25,7 @@ from .models import (
     InvalidateRequest,
     InvalidatedTrackPoint,
     MessageData,
+    PositionConflict,
     ReviewBatch,
     ReviewBatchSummary,
     ReviewCreateRequest,
@@ -65,6 +66,8 @@ app = FastAPI(
         "marked invalid via POST /tracks/invalidate: it disappears from "
         "GET /tracks, the position snapshot falls back to the latest "
         "valid point, and the point can never be re-activated. "
+        "GET /conflicts lists same-instant source pairs whose stored "
+        "valid points for one MMSI disagree by more than 1852 m. "
         "Ambiguous batches can be stored via POST /reviews "
         "for manual review; a human picks one listed candidate per ambiguous "
         "pool and POST /reviews/{batch_id}/resolve applies the selection "
@@ -291,6 +294,30 @@ def get_track(source_id: str, mmsi: int):
     return VesselTrack(
         source_id=source_id, mmsi=mmsi, points=store.get_track(source_id, mmsi)
     )
+
+
+@app.get(
+    "/conflicts",
+    response_model=list[PositionConflict],
+    tags=["snapshots"],
+    description=(
+        "List same-instant multi-source position conflicts. For every MMSI "
+        "and UTC observed_at, each pair of *different* sources whose track "
+        "actually stored, still-valid points with both coordinates present "
+        "are more than 1852 m apart (strictly, great-circle distance) is one "
+        "row. Optional filters: ``mmsi`` keeps one vessel, ``source_id`` "
+        "keeps pairs where either side is that source. Ordered by "
+        "observed_at, MMSI, source_a then source_b. The list is derived "
+        "from the tracks and updated atomically with every ingest, review "
+        "resolution and invalidation; invalidating one side removes exactly "
+        "the pairs involving it, other over-limit pairs remain, and a later "
+        "resubmission never restores removed rows."
+    ),
+)
+def list_conflicts(
+    source_id: Optional[str] = None, mmsi: Optional[int] = None
+):
+    return get_store().list_conflicts(source_id=source_id, mmsi=mmsi)
 
 
 @app.post(

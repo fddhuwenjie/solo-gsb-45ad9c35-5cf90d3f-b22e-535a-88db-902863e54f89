@@ -367,3 +367,40 @@ class ReviewBatch(ReviewBatchSummary):
     results: list[DecodeResult]
     selections: Optional[list[list[int]]] = None
     snapshots: Optional[list[VesselSnapshot]] = None
+
+
+# ---------------------------------------------------------------------------
+# Same-instant multi-source position conflicts
+# ---------------------------------------------------------------------------
+
+class ConflictParty(BaseModel):
+    """One side of a same-instant position conflict: one source's point."""
+
+    source_id: str = Field(
+        ..., description="Receiver/source that actually stored the track point.")
+    longitude: float = Field(..., description="Degrees, as decoded and stored.")
+    latitude: float = Field(..., description="Degrees, as decoded and stored.")
+
+
+class PositionConflict(BaseModel):
+    """One source pair whose same-instant points disagree by over 1 nautical mile.
+
+    Both points are *actually stored* in the track for the same MMSI at the
+    same UTC ``observed_at``: still valid (not invalidated) and with both
+    coordinates present. The two sides are ordered by ``source_id``
+    (``source_a`` < ``source_b``); the list itself is ordered by
+    ``observed_at``, MMSI and the two source ids.
+    """
+
+    observed_at: datetime = Field(
+        ..., description="UTC observation time shared by both track points.")
+    mmsi: int
+    source_a: ConflictParty
+    source_b: ConflictParty
+    distance_m: float = Field(
+        ...,
+        description=(
+            "Great-circle distance between the two points in metres "
+            "(mean-radius haversine); strictly greater than 1852."
+        ),
+    )
