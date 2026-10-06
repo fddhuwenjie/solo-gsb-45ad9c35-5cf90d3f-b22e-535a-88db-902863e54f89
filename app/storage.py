@@ -44,6 +44,17 @@ in one transaction:
 Databases written before the invalidation columns existed are migrated
 in place (``ALTER TABLE``) when the store is opened.
 
+``position_conflict``: one row per *source pair* reporting the same MMSI
+at the same UTC ``observed_at`` at positions strictly more than one
+nautical mile (1852 m) apart. Only track points that are actually stored,
+still valid and carry complete coordinates participate. The list is a
+derived view of ``vessel_track``: every write path and every
+invalidation refreshes the affected ``(mmsi, observed_at)`` groups in
+the same transaction, and opening any database rebuilds the whole list,
+so older databases surface their conflicts after an upgrade and results
+stay identical across restarts. Invalidating one point removes exactly
+the pairs involving it; pairs of the other sources are kept.
+
 ``review_batch``: one row per manual-review batch created from an ambiguous
 batch of sentences. The original sentences and the full decode outcome
 (including every candidate of every ambiguous pool) are stored as JSON, so
@@ -54,12 +65,15 @@ snapshot and track writes and flips the status in a single transaction.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import Optional
 
 from .models import (
+    PositionConflict,
+    PositionConflictPoint,
     PositionReport,
     StaticAndVoyageData,
     TimedPositionReport,
@@ -70,6 +84,12 @@ from .models import (
 
 KIND_POSITION = "position"
 KIND_STATIC = "static"
+
+# Two simultaneous reports of one MMSI are a conflict only when strictly
+# farther apart than one nautical mile (the haversine comparison is
+# ``>``; exactly 1852 m is not a conflict).
+CONFLICT_DISTANCE_METRES = 1852.0
+EARTH_RADIUS_METRES = 6_371_000.0
 
 # sentence_index recorded for track points backfilled from pre-existing
 # vessel_state rows of an older database (no earlier track is inferred).
@@ -107,6 +127,19 @@ CREATE TABLE IF NOT EXISTS review_batch (
     results      TEXT NOT NULL,
     resolution   TEXT
 );
+
+CREATE TABLE IF NOT EXISTS position_conflict (
+    mmsi         INTEGER NOT NULL,
+    observed_at  TEXT NOT NULL,
+    source_id_a  TEXT NOT NULL,
+    source_id_b  TEXT NOT NULL,
+    longitude_a  REAL NOT NULL,
+    latitude_a   REAL NOT NULL,
+    longitude_b  REAL NOT NULL,
+    latitude_b   REAL NOT NULL,
+    distance_m   REAL NOT NULL,
+    PRIMARY KEY (mmsi, observed_at, source_id_a, source_id_b)
+) WITHOUT ROWID;
 """
 
 # Existing position snapshots of an older database become one starting
@@ -144,6 +177,22 @@ ON CONFLICT (source_id, mmsi, kind) DO UPDATE SET
 WHERE excluded.observed_at > vessel_state.observed_at
 """
 
+# The conflict list is recomputed per (mmsi, observed_at) group: the
+# stored pairs are deleted first, then every pair of valid points from
+# distinct sources with complete coordinates strictly farther apart than
+# one nautical mile is inserted. The ordering constraint makes each source
+# pair canonical (source_id_a < source_id_b).
+_DELETE_CONFLICTS_FOR_GROUP_SQL = """
+DELETE FROM position_conflict
+WHERE mmsi = ? AND observed_at = ?
+"""
+
+_VALID_POSITIONS_FOR_GROUP_SQL = """
+SELECT source_id, data
+FROM vessel_track
+WHERE mmsi = ? AND observed_at = ? AND valid = 1
+"""
+
 
 def normalize_observed_at(value: datetime) -> str:
     """Fixed-width UTC ISO 8601 string; lexicographic order == time order."""
@@ -156,6 +205,22 @@ def normalize_observed_at(value: datetime) -> str:
 
 def _parse_observed_at(text: str) -> datetime:
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def haversine_metres(
+    lon_a: float, lat_a: float, lon_b: float, lat_b: float
+) -> float:
+    """Great-circle distance between two WGS-84 coordinates, in metres."""
+    lon1, lat1, lon2, lat2 = map(
+        math.radians, (lon_a, lat_a, lon_b, lat_b)
+    )
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+    )
+    return 2.0 * EARTH_RADIUS_METRES * math.asin(math.sqrt(a))
 
 
 class SnapshotStore:
@@ -181,6 +246,11 @@ class SnapshotStore:
             for column, ddl in _MIGRATE_TRACK_COLUMNS:
                 if column not in columns:
                     self._conn.execute(ddl)
+            # The conflict list is a derived view of vessel_track: rebuild it
+            # wholesale when opening an older database (missing conflicts for
+            # simultaneous reports are backfilled even when the track rows
+            # already existed), and idempotently in every other case.
+            self._rebuild_all_conflicts()
 
     def close(self) -> None:
         with self._lock:
@@ -212,6 +282,7 @@ class SnapshotStore:
         observed_at: str,
         data: dict,
         sentence_index: int = 0,
+        affected: Optional[set[tuple[int, str]]] = None,
     ) -> bool:
         """Upsert the snapshot row and record a position track point.
 
@@ -224,11 +295,17 @@ class SnapshotStore:
         entirely — an invalidated misreport is never re-activated or
         written back into the snapshot. Caller must hold the lock and the
         transaction.
+
+        Every attempted position write (including a skipped retransmission
+        or an invalidated-key write) registers its ``(mmsi, observed_at)``
+        group in *affected*, so the caller can refresh exactly the
+        position-conflict pairs the batch could have changed.
         """
-        if kind == KIND_POSITION and self._point_invalidated(
-            source_id, mmsi, observed_at
-        ):
-            return False
+        if kind == KIND_POSITION:
+            if affected is not None:
+                affected.add((mmsi, observed_at))
+            if self._point_invalidated(source_id, mmsi, observed_at):
+                return False
         payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
         cursor = self._conn.execute(
             _UPSERT_SQL, (source_id, mmsi, kind, observed_at, payload)
@@ -239,6 +316,73 @@ class SnapshotStore:
                 (source_id, mmsi, observed_at, sentence_index, payload),
             )
         return cursor.rowcount > 0
+
+    # -- position conflicts -----------------------------------------------------
+
+    @staticmethod
+    def _coordinates(data: str) -> Optional[tuple[float, float]]:
+        """``(longitude, latitude)`` from a stored track payload, else None."""
+        message = json.loads(data)
+        longitude = message.get("longitude")
+        latitude = message.get("latitude")
+        if longitude is None or latitude is None:
+            return None
+        return longitude, latitude
+
+    def _refresh_conflicts(
+        self, groups: set[tuple[int, str]]
+    ) -> None:
+        """Recompute every source-pair conflict of the given time groups.
+
+        For each ``(mmsi, observed_at)`` the stored pairs are deleted and
+        re-created from the valid track points of *distinct* sources that
+        carry complete coordinates and are strictly farther apart than
+        one nautical mile. The recomputation is a derived, idempotent view
+        of ``vessel_track``; the caller runs it inside the write
+        transaction so conflict rows commit together with track writes,
+        review status or an invalidation (a failure rolls all back).
+        """
+        for mmsi, observed_at in groups:
+            self._conn.execute(
+                _DELETE_CONFLICTS_FOR_GROUP_SQL, (mmsi, observed_at)
+            )
+            points: list[tuple[str, float, float]] = []
+            for row in self._conn.execute(
+                _VALID_POSITIONS_FOR_GROUP_SQL, (mmsi, observed_at)
+            ):
+                coordinates = self._coordinates(row["data"])
+                if coordinates is not None:
+                    points.append((row["source_id"], *coordinates))
+            points.sort(key=lambda item: item[0])
+            for i in range(len(points)):
+                source_a, lon_a, lat_a = points[i]
+                for j in range(i + 1, len(points)):
+                    source_b, lon_b, lat_b = points[j]
+                    distance = haversine_metres(lon_a, lat_a, lon_b, lat_b)
+                    if distance > CONFLICT_DISTANCE_METRES:
+                        self._conn.execute(
+                            """
+                            INSERT INTO position_conflict
+                                (mmsi, observed_at, source_id_a, source_id_b,
+                                 longitude_a, latitude_a, longitude_b, latitude_b,
+                                 distance_m)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                mmsi, observed_at, source_a, source_b,
+                                lon_a, lat_a, lon_b, lat_b, distance,
+                            ),
+                        )
+
+    def _rebuild_all_conflicts(self) -> None:
+        """Recompute the full conflict list from every stored track point."""
+        groups = {
+            (row["mmsi"], row["observed_at"])
+            for row in self._conn.execute(
+                "SELECT DISTINCT mmsi, observed_at FROM vessel_track"
+            )
+        }
+        self._refresh_conflicts(groups)
 
     def upsert_if_newer(
         self,
@@ -254,10 +398,16 @@ class SnapshotStore:
         still enter the track; a repeated submission at the same
         ``observed_at`` does not duplicate it). *observed_at* must be
         normalised with :func:`normalize_observed_at`. Returns True when
-        the snapshot row was (re)written.
+        the snapshot row was (re)written. The position-conflict groups the
+        write can change are refreshed in the same transaction.
         """
         with self._lock, self._conn:
-            return self._write_message(source_id, mmsi, kind, observed_at, data)
+            affected: set[tuple[int, str]] = set()
+            changed = self._write_message(
+                source_id, mmsi, kind, observed_at, data, affected=affected
+            )
+            self._refresh_conflicts(affected)
+            return changed
 
     def apply_ingest(
         self,
@@ -268,14 +418,18 @@ class SnapshotStore:
         *writes* are
         ``(source_id, mmsi, kind, observed_at, data, sentence_index)``
         tuples, already ordered by original sentence index. Snapshot
-        upserts and position track inserts commit or roll back together.
-        Returns the involved vessels' ``(source_id, mmsi)`` pairs.
+        upserts, position track inserts and position-conflict refreshes
+        commit or roll back together. Returns the involved vessels'
+        ``(source_id, mmsi)`` pairs.
         """
         with self._lock, self._conn:
+            affected: set[tuple[int, str]] = set()
             for source_id, mmsi, kind, observed_at, data, sentence_index in writes:
                 self._write_message(
-                    source_id, mmsi, kind, observed_at, data, sentence_index
+                    source_id, mmsi, kind, observed_at, data,
+                    sentence_index, affected=affected,
                 )
+            self._refresh_conflicts(affected)
             return sorted({(w[0], w[1]) for w in writes})
 
     # -- reads ----------------------------------------------------------------
@@ -386,6 +540,56 @@ class SnapshotStore:
             for row in rows
         ]
 
+    # -- position conflicts -----------------------------------------------------
+
+    def list_position_conflicts(
+        self,
+        source_id: Optional[str] = None,
+        mmsi: Optional[int] = None,
+    ) -> list[PositionConflict]:
+        """Stored same-instant, far-apart source pairs, oldest conflict first.
+
+        Only points actually kept in ``vessel_track`` (not invalidated) with
+        complete coordinates on both sides participate, and pairs are
+        listed only when the great-circle distance is strictly greater
+        than one nautical mile. Ordered by ``observed_at``, then MMSI,
+        then the two source ids. An optional *source_id* filter matches a
+        conflict on either side; an optional *mmsi* filter narrows the
+        vessel.
+        """
+        sql = "SELECT * FROM position_conflict"
+        clauses: list[str] = []
+        params: list = []
+        if source_id is not None:
+            clauses.append("(source_id_a = ? OR source_id_b = ?)")
+            params.extend((source_id, source_id))
+        if mmsi is not None:
+            clauses.append("mmsi = ?")
+            params.append(mmsi)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += (
+            " ORDER BY observed_at, mmsi, source_id_a, source_id_b"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [
+            PositionConflict(
+                mmsi=row["mmsi"],
+                observed_at=_parse_observed_at(row["observed_at"]),
+                source_id_a=row["source_id_a"],
+                point_a=PositionConflictPoint(
+                    longitude=row["longitude_a"], latitude=row["latitude_a"]
+                ),
+                source_id_b=row["source_id_b"],
+                point_b=PositionConflictPoint(
+                    longitude=row["longitude_b"], latitude=row["latitude_b"]
+                ),
+                distance_m=round(row["distance_m"], 3),
+            )
+            for row in rows
+        ]
+
     # -- track point invalidation ----------------------------------------------
 
     def _fallback_position_snapshot(
@@ -487,6 +691,9 @@ class SnapshotStore:
                 (reason, invalidated_at, source_id, mmsi, observed_at),
             )
             self._fallback_position_snapshot(source_id, mmsi, observed_at)
+            # Pairs involving the now-invalid point are removed; pairs of
+            # the other sources at this time are recomputed and kept.
+            self._refresh_conflicts({(mmsi, observed_at)})
             return point, reason, invalidated_at
 
     # -- review batches -------------------------------------------------------
@@ -551,10 +758,15 @@ class SnapshotStore:
             ).fetchone()
             if row is None or row["status"] != "pending":
                 return None
+            affected: set[tuple[int, str]] = set()
             for source_id, mmsi, kind, observed_at, data, sentence_index in writes:
                 self._write_message(
-                    source_id, mmsi, kind, observed_at, data, sentence_index
+                    source_id, mmsi, kind, observed_at, data,
+                    sentence_index, affected=affected,
                 )
+            # A late resolution backfills historical conflicts even when
+            # it does not change the latest /vessels snapshots.
+            self._refresh_conflicts(affected)
             involved = sorted({(w[0], w[1]) for w in writes})
             snapshots = [
                 self._to_snapshot(source_id, mmsi, self._fetch_rows(source_id, mmsi))

@@ -25,6 +25,7 @@ from .models import (
     InvalidateRequest,
     InvalidatedTrackPoint,
     MessageData,
+    PositionConflict,
     ReviewBatch,
     ReviewBatchSummary,
     ReviewCreateRequest,
@@ -68,7 +69,12 @@ app = FastAPI(
         "Ambiguous batches can be stored via POST /reviews "
         "for manual review; a human picks one listed candidate per ambiguous "
         "pool and POST /reviews/{batch_id}/resolve applies the selection "
-        "to the snapshots atomically."
+        "to the snapshots atomically. "
+        "GET /position-conflicts lists same-instant source pairs whose "
+        "stored, valid, complete position reports of one MMSI disagree by "
+        "more than one nautical mile (1852 m) great-circle distance; the "
+        "list is maintained in the same transactions as track writes, "
+        "review resolution and invalidation and survives restarts."
     ),
 )
 
@@ -291,6 +297,32 @@ def get_track(source_id: str, mmsi: int):
     return VesselTrack(
         source_id=source_id, mmsi=mmsi, points=store.get_track(source_id, mmsi)
     )
+
+
+@app.get(
+    "/position-conflicts",
+    response_model=list[PositionConflict],
+    tags=["snapshots"],
+    description=(
+        "List same-instant position conflicts between receivers: for one "
+        "MMSI and one UTC observed_at, two distinct source_ids each have a "
+        "stored, still-valid track point with complete coordinates whose "
+        "great-circle distance is strictly greater than 1852 m (one "
+        "nautical mile). Pending review batches, unchosen ambiguous "
+        "candidates and same-instant retransmissions add no record. "
+        "Resolving a review batch backfills historical conflicts even "
+        "when the GET /vessels snapshot is unchanged; invalidating one "
+        "point removes exactly the pairs involving it while other "
+        "over-limit pairs are kept. Ordered by observed_at, then MMSI, "
+        "then the two source ids. Optional source_id matches either side; "
+        "optional mmsi narrows the vessel. The list is persisted in "
+        "SQLite and is identical after a restart."
+    ),
+)
+def list_position_conflicts(
+    source_id: Optional[str] = None, mmsi: Optional[int] = None
+):
+    return get_store().list_position_conflicts(source_id=source_id, mmsi=mmsi)
 
 
 @app.post(

@@ -305,6 +305,44 @@ class InvalidatedTrackPoint(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Position conflicts between simultaneously reporting receivers
+# ---------------------------------------------------------------------------
+
+class PositionConflictPoint(BaseModel):
+    """One side of a conflicting source pair: coordinates as stored."""
+
+    longitude: float = Field(
+        ..., description="Degrees, taken from the stored track point.")
+    latitude: float = Field(
+        ..., description="Degrees, taken from the stored track point.")
+
+
+class PositionConflict(BaseModel):
+    """Two receivers reporting one MMSI at the same UTC instant more than
+    one nautical mile apart.
+
+    Only track points actually stored (never invalidated), with complete
+    coordinates on both sides, participate; the great-circle distance is
+    strictly greater than 1852 m. Lists are ordered by observed time,
+    then MMSI, then the two source ids.
+    """
+
+    mmsi: int
+    observed_at: datetime = Field(
+        ..., description="UTC observation time shared by both reports.")
+    source_id_a: str = Field(
+        ..., description="First source id (lexicographically smaller).")
+    point_a: PositionConflictPoint = Field(
+        ..., description="Coordinates reported by ``source_id_a``.")
+    source_id_b: str = Field(
+        ..., description="Second source id (lexicographically larger).")
+    point_b: PositionConflictPoint = Field(
+        ..., description="Coordinates reported by ``source_id_b``.")
+    distance_m: float = Field(
+        ..., description="Great-circle distance in metres; strictly > 1852.")
+
+
+# ---------------------------------------------------------------------------
 # Manual review of ambiguous batches
 # ---------------------------------------------------------------------------
 

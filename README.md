@@ -12,6 +12,10 @@
 对无 `sequence_id` 的歧义批，`POST /reviews` 可建立**待核定批**（保存原批与各歧义池全部候选，
 不写快照），由人工核定后经 `POST /reviews/{batch_id}/resolve` 把选定候选连同本批明确解码结果
 原子写入快照；`GET /reviews` / `GET /reviews/{batch_id}` 随时查询待核定批、候选与核定结果。
+对**同一 MMSI、同一 UTC observed_at**被多个接收站同时上报的情况，服务还维护一份**船位冲突清单**：
+不同 `source_id` 实际保存在轨迹中、未作废且经纬度齐全的船位，两点大圆距离**严格超过 1852 米**
+（1 海里）时记一条来源对冲突，由 `GET /position-conflicts` 查询（双方来源、坐标与距离，
+按时间、MMSI、来源 ID 排序）。
 
 ## 功能
 
@@ -65,6 +69,15 @@
     不留部分写入；**核定状态与快照写入同事务**，已核定批不可改选或重复写入；
   - 核定前已有更晚观测写入时**较新快照不回滚**，批次仍记为已核定并返回**实际保存的快照**；
   - `GET /reviews` / `GET /reviews/{batch_id}` 查询待核定批、候选与核定结果，**重启后仍可查询**。
+- **船位冲突清单（`GET /position-conflicts`）**：
+  - 对**同一 MMSI、同一 UTC `observed_at`**，取轨迹中**实际保存、未作废且经纬度齐全**的不同
+    `source_id` 船位，两点**大圆距离严格超过 1852 米**时记一条来源对冲突；
+  - `/ingest` 的**明确解码**（包括歧义批返回 409 时其中的明确船位）与歧义批**人工核定**都会
+    在同一事务内更新清单；**待核定批、未选中的歧义候选、同刻重发**都不增加记录；
+  - **迟到核定**即使不改变 `/vessels` 最新快照，也会把旧观测时刻的历史冲突补齐；
+  - 作废一个船位时在同一事务移除**涉及它的来源对**，其他超限来源对保留；此后同刻重投不能恢复记录；
+  - 打开旧版 SQLite 数据库时由现存轨迹整表重建清单（旧快照已回填为轨迹起点），
+    Compose 重启后查询结果一致，失败不留部分更新。
 - 交互式 API 文档：`/docs`（Swagger UI）、`/redoc`。
 
 ## 快速开始
@@ -94,7 +107,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 105 个单元/集成测试
+pytest -q          # 124 个单元/集成测试
 ```
 
 ## API
@@ -294,6 +307,91 @@ curl -s -X POST http://localhost:8000/tracks/invalidate \
 curl -s 'http://localhost:8000/tracks?source_id=ais-receiver-1&mmsi=366999999'
 curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
 ```
+
+### `GET /position-conflicts`（多站船位冲突清单）
+
+多个接收站在**同一 UTC 时刻**上报同一 MMSI 时，只要两侧都是轨迹中**实际保存、未作废且经纬度
+齐全**的船位、且两点大圆距离（haversine，地球半径 6371 km）**严格超过 1852 米**，清单中就有一条
+来源对冲突。两个来源 ID 按字典序分别放入 `source_id_a` / `source_id_b`。
+
+两个查询参数均可选（省略则列出全部；`source_id` 匹配来源对的任一侧）：
+
+```
+GET /position-conflicts
+GET /position-conflicts?source_id=ais-receiver-2
+GET /position-conflicts?source_id=ais-receiver-2&mmsi=366999999
+```
+
+```bash
+curl -s 'http://localhost:8000/position-conflicts'
+```
+
+返回按 **`observed_at` 升序、再按 `mmsi`、再按两侧来源 ID** 排序的数组：
+
+```json
+[
+  {
+    "mmsi": 366999999,
+    "observed_at": "2026-10-05T11:00:00Z",
+    "source_id_a": "ais-receiver-1",
+    "point_a": { "longitude": -73.9835, "latitude": 40.7484 },
+    "source_id_b": "ais-receiver-2",
+    "point_b": { "longitude": -73.955, "latitude": 40.7484 },
+    "distance_m": 2400.823
+  }
+]
+```
+
+| 语义 | 是否产生冲突记录 |
+| ---- | ---- |
+| `/ingest` 明确解码并实际保存的船位 | 是（含歧义批 409 中的明确船位） |
+| 歧义批**人工核定**后写入的船位 | 是（迟到核定补齐历史冲突，即使 `/vessels` 快照未变） |
+| 建待核定批（`POST /reviews`）、未选中的歧义候选 | 否 |
+| 同刻重发 / 同源同刻第二条船位 | 否（`INSERT OR IGNORE`，先保存者唯一） |
+| 任一侧经纬度为 `null` | 否 |
+| 已作废的轨迹点 | 否（不参与，且不能被同刻重投恢复） |
+| 距离 ≤ 1852 m（恰好 1852 m 也不算） | 否 |
+
+#### 冲突出现与解除的 HTTP 调用示例
+
+```bash
+# 1) 接收站 1 在 11:00 上报船位
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T11:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreE9HGD@44gkg40000,0*1C"}]}'
+
+# 2) 接收站 2 同一刻上报相差约 2.4 km 的船位 -> 清单出现 1 条冲突
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T11:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-2",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreMOhGD@44gkgp0000,0*06"}]}'
+curl -s 'http://localhost:8000/position-conflicts'
+# [{"mmsi":366999999,"observed_at":"2026-10-05T11:00:00Z",
+#   "source_id_a":"ais-receiver-1", ..., "source_id_b":"ais-receiver-2",
+#   "distance_m":2400.823}]
+
+# 3) 作废其中一侧的误报点 -> 涉及它的来源对移除，清单变空
+curl -s -X POST http://localhost:8000/tracks/invalidate \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id":"ais-receiver-2","mmsi":366999999,
+       "observed_at":"2026-10-05T11:00:00Z","reason":"接收站误报：岸站标校错误"}'
+curl -s 'http://localhost:8000/position-conflicts'   # []
+
+# 4) 同刻重投该点不能恢复冲突（也不能重新激活轨迹点）
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T11:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-2",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreMOhGD@44gkgp0000,0*06"}]}'
+curl -s 'http://localhost:8000/position-conflicts'   # 仍为 []
+```
+
+三个来源同刻两两超限时，清单包含全部 3 条来源对；作废其中一个点只移除**涉及它**的两条，
+其余来源对保留。冲突清单与轨迹写入、核定状态翻转或作废**同一事务**提交——任一步失败整体
+回滚，不留部分更新；数据持久化于 SQLite，重启后结果一致，旧版数据库打开时由现存轨迹整表重建。
 
 ### `POST /reviews`（建立待核定批）
 
@@ -723,20 +821,28 @@ curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
   （`selections` + 实际写入的快照）以 JSON 持久化在同一 SQLite 库中，重启后仍可查询；
   核定时“应用全部快照与轨迹写入 + 翻转批次状态”在**单个事务**内完成——任一失败整体回滚，
   批次保持待核定且不留任何轨迹点；状态翻转带 `status='pending'` 条件，并发/重复核定只会成功一次。
+- **船位冲突清单**：`position_conflict` 是轨迹的派生视图，主键为
+  `(mmsi, observed_at, source_id_a, source_id_b)`，来源对按字典序规范化（a < b），
+  存双方坐标与大圆距离（haversine，地球半径 6371 km）。每个写入事务（`/ingest` 与
+  核定）只删除并重算本批涉及的 `(mmsi, observed_at)` 组；作废事务重算被作废点所在组，
+  因而“涉及它的来源对移除、其他保留”，重算天然幂等，同刻重发不会恢复任何记录。
+  判定直接基于**轨迹中未作废且经纬度齐全**的点，与 `/vessels` 最新快照无关，因此迟到核定
+  即使不回滚快照也会补齐历史冲突。打开旧库时在迁移事务内由现存轨迹（含旧快照回填的唯一起点）
+  整表重建，升级后即可查出冲突，且重复打开结果不变。
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 入口，POST /decode、/ingest、/tracks/invalidate、/reviews、GET /vessels、/tracks、/reviews、/health
-  models.py      # Pydantic 请求/响应模型（含快照、船位轨迹、误报标记与核定批模型）
+  main.py        # FastAPI 入口，POST /decode、/ingest、/tracks/invalidate、/reviews、GET /vessels、/tracks、/position-conflicts、/reviews、/health
+  models.py      # Pydantic 请求/响应模型（含快照、船位轨迹、误报标记、船位冲突与核定批模型）
   nmea.py        # NMEA 0183 语句解析与校验（XOR 校验和、分片、fill bits）
   ais.py         # 六位 armour、位提取、消息 1/2/3 与 5 解码
   assembler.py   # 归组、乱序重组、孤儿分片池歧义枚举
-  storage.py     # SQLite 快照、船位轨迹（含旧库起点回填）、误报标记与核定批持久化（单事务）
+  storage.py     # SQLite 快照、船位轨迹（含旧库起点回填）、误报标记、船位冲突清单与核定批持久化（单事务）
 scripts/
   generate_examples.py  # 重新生成 README/测试中的示例报文
-tests/           # pytest 单元与 API 集成测试（含快照、轨迹时序语义、误报标记与人工核定流程）
+tests/           # pytest 单元与 API 集成测试（含快照、轨迹时序语义、误报标记、船位冲突与人工核定流程）
 Dockerfile
 docker-compose.yml      # 命名卷 ais-data 持久化 /data/ais.db
 requirements.txt / requirements-dev.txt
